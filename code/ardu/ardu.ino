@@ -1,724 +1,428 @@
 /*-----------------------------------------------------------------------------
-    Author: Felipe G. Nievinski <fgnievinski@gmail.com>
-    Author: Nelso G. Jost
-    Author: Cristthian Marafigo Arpino
-    Author: Lucas Doria de Carvalo
-    Author: Iuri Mendonça Tinti
-    Author: Guilherme Domingos Santana
-    License: GPLv2
-    Purpose: Firmware to perform simple datalog of GPS raw data with the
-             Adalogger Feather board and GPS Feathering module.
-             Arduino IDE and PlatformIO compatible.
-  ---------------------------------------------------------------------------*/
+ *  Author: Felipe G. Nievinski <fgnievinski@gmail.com>
+ *  Author: Nelso G. Jost <nelsojost@gmail.com>
+ *  Author: Cristthian Marafigo Arpino <cristthian.m.arpino@protonmail.com>
+ *  Author: Lucas Doria de Carvalo <lucas.doria@ufrgs.br>
+ *  Author: Iuri Mendonça Tinti <iuri.tinti@inf.ufrgs.br>
+ *  License: GPLv2
+ *  Purpose: Firmware to perform simple datalog of GPS raw data with the
+ *           Adalogger Feather board and GPS Feathering module.
+ *           Arduino IDE and PlatformIO compatible.
+ *---------------------------------------------------------------------------*/
 #include <SPI.h>
-#include "SdFat.h"
-#include "sdios.h"
-#include <string.h>
+#include <SD.h>
 
-// USER SETTINGS
+#define GPSSerial          Serial1
+#define GPSSerialEvent     serialEvent1
 
-// file duration:
-const char fileDuration = 'H';     // use 'H' to save by Hour
-//const char fileDuration = 'D';     // use 'D' to save by Day
-
-// time interval between GPS readings (in milliseconds):
-//#define GPS_UPDATE_INTERVAL  1000  //1Hz
-//#define GPS_UPDATE_INTERVAL  500 //2Hz
-//#define GPS_UPDATE_INTERVAL  200 //5Hz
-#define GPS_UPDATE_INTERVAL  100 //10Hz 
-// The possible interval values range between 100 and 10000 milliseconds.
-// Examples: 10000 ms (10 s, 0.1 Hz), 1000 ms (1 s, 1 Hz), 100 ms (0.1 s, 10 Hz), 500 ms (0.5 s, 2 Hz), etc.
-// Note: high sampling rates (greater than 1 Hz -- intervals smaller than 1000 ms) require the faster M0 board instead of 32u4.
-
-// are you using the M0 board instead of 32u4?
-#define USING_M0_BOARD
-
-// battery update interval (in milliseconds; zero to disable)
-#define BATTERY_UPDATE_INTERVAL  60000  // every minute
-//#define BATTERY_UPDATE_INTERVAL  1000  // every second
-
-// give visual indication that SD writing is okay?
-#define BLINK_LED_IF_WRITING_OKAY
-
-// print brief messages to USB serial?
-#define DEBUG
-
-// print detailed messages to USB serial?
-//#define VERBOSE
-
-// optimize settings for high-rate logging (>1Hz)?
-//#define HIGH_RATE_OPTIMIZED
-#ifdef HIGH_RATE_OPTIMIZED
-// disable features that would slow down the loop:
-#undef VERBOSE
-#undef DEBUG
-//#undef BLINK_LED_IF_WRITING_OKAY
-#define BATTERY_UPDATE_INTERVAL  0
-#endif
-
-// wait for valid GPS or write to DEFAULT.LOG file meanwhile?
-//#define WAIT_FOR_VALID_GPS  // if not defined, we'll write to default file.
-
-
-// wait for USB connection to PC?
-// (useful for not missing first debug messages)
-// Note: leave it undefined for field deployment!!!
-//#define WAIT_FOR_USB
-
-
-// INTERNAL SETTINGS
-
-// GPS baud rates:
-#define GPS_BAUD_RATE_DEFAULT    9600   // original GPS firmware
+#define GPS_BAUD_RATE_DEFAULT    9600   // original firmware
 #define GPS_BAUD_RATE  115200
 
-// time to wait for the GPS to finish writing data to buffer:
-#define BUFFER_IDLE_THRESHOLD      10             // milliseconds
-// It should be greater than 5 ms, which is the maximum time between GPS serial events (determined experimentally).
+// time between GPS readings:
+#define  GPS_UPDATE_INTERVAL  1000          // in milliseconds
+// suported values: 1000 ms   (1 Hz rate)
+//                  10000 ms  (100 mHz rate)
+// ATTENTION: SD flush/close takes about 200 ms!!
+//            Thus higher rates such as 5 Hz or 10 Hz may not comply.
 
-// time interval between SD card writings (in milliseconds) - EXPERIMENTAL:
-#define  SDCARD_UPDATE_INTERVAL  GPS_UPDATE_INTERVAL
-// Note: SDCARD_UPDATE_INTERVAL cannot be much greater than GPS_UPDATE_INTERVAL, otherwise the buffer will not fit in memory.
-// Note: in any case, SDCARD_UPDATE_INTERVAL will only take effect when the GPS buffer is idle.
-// Note: this is an experimental feature.
+// time to wait for the GPS to finish sending data:
+#define  IDLE_THRESHOLD      10             // milliseconds
+// It should be greater than 5 ms, which is 
+// the maximum time between GPS serial events (determined experimentally).
+// It should be smaller than GPS_UPDATE_INTERVAL, 
+// otherwise the buffer might have to hold more than one block of GPS data.
 
-#define MaxFreeSpaceSdCard 32000 //value in MB 
+#define  BLINK_LED_IF_OKAY  // give visual indication that writing is okay
+//#define WAIT_FOR_VALID_GPS  // if not defined, we'll write to default file.
 
-// typical GPS block size
-#define  GPS_BLOCK_SIZE_TYPICAL 512
+#define  GPS_BUFFER_SIZE_TYPICAL 512  // typical buffer size, for pre-allocation
 
-// typical buffer size, for pre-allocation:
-const int GPS_BUFFER_SIZE_TYPICAL = GPS_BLOCK_SIZE_TYPICAL *
-                                    ceil((double) SDCARD_UPDATE_INTERVAL / GPS_UPDATE_INTERVAL);
+#define MAX_BASENAME_LEN 8+1  // FAT limit: 8.3
+#define MAX_FILENAME_LEN MAX_BASENAME_LEN-1+1+3+1  // basename-null+dot+ext+null
 
-// file name limits:
-#define BASENAME_LEN_MAX 8+1  // FAT limit: 8.3
-#define FILENAME_LEN_MAX BASENAME_LEN_MAX-1+1+3+1  // basename-null+dot+extension+null
+// check if USB serial port is open before printing:
+#define serialPrint if(Serial)Serial.print
+#define serialPrintln if(Serial)Serial.println
 
-// maximum NMEA sentence length
-// (as per <https://en.wikipedia.org/wiki/NMEA_0183>)
-#define NMEA_SENTENCE_LEN_MAX 82
-
-// define battery voltage pin:
-#ifdef USING_M0_BOARD
-#define VBATPIN A7 // M0 battery voltage pin
-#else
-#define VBATPIN A9  // 32u4 battery voltage pin
-#endif
-
-#ifdef DEBUG
-// print to USB serial (checking if port is open):
-#define serialPrint(x) if(Serial)Serial.print(x)
-#define serialPrintln(x) if(Serial)Serial.println(x)
-#else
-// ignore status messages completely:
-#define serialPrint(x)
-#define serialPrintln(x)
-#endif
-
-#define gpsSerial Serial1
-#define gpsSerialEvent serialEvent1
-#ifdef USING_M0_BOARD
-void gpsSerialEvent();
-#endif
-
-
-// global variables and constants:
 const int SDCard = 4;  // SD card ID
 const char basenameDefault[] = "DEFAULT";
-char basenameOld[BASENAME_LEN_MAX];  // last used basename
-String buffer = "";   // to hold the incoming GPS data
-unsigned long bufferTimeEnd = millis();  // timer to indicate when buffer was last written
-unsigned long sdcardTimeEnd = millis();  // timer to indicate when SD card was last written
-unsigned long batteryTimeEnd = millis();  // timer to indicate when battery voltage was last written
-SdFat sd; // variable to use in SdFat functions
-char hour[2] = {1,8};  //schedule for verify free space on Sd Card
-char oldestFileLOG[9]; // variable to store the name of oldest file 
-char oldestFileBAT[9]; 
-bool alreadyVerifiedSpace=false;
+String GPSBuffer = "";   // to hold the incoming GPS data
+unsigned long bufferTime = millis();  // timer to indicate when GPS was last read
+const char fileDuration = 'D';     // Use 'H' to save by Hour or 'D' to save by Day
+
+// battery settings:
+#define BATTERY_UPDATE_INTERVAL  60000      // in milliseconds; zero to disable.
+//#define BATTERY_UPDATE_INTERVAL  1000      // in milliseconds; zero to disable.
+#define VBATPIN A9  // battery voltage pin
+unsigned long batteryTimeEnd = millis();  // timer to indicate when battery was last checked
+unsigned long batteryTimeBusy = 0;  // time duration spent busy writing battery
+
+int numBlk=0;  // number of GPS data blocks per file
+char basenameOld[MAX_BASENAME_LEN];  // last used basename
+
 // function prototypes:
-bool initSD(void);
-bool getRMCSentence(const char strInp[], char strOut[]);
-bool getDateTime(const char strInp[], char dateTime[]);
-void resetBuffer(void);
 void configGPS(void);
-void configGPSBaudRate(void);
-void getBasename(char basename[], const char dateTime[], bool isGPSValid);
-void datalog(const char basename[], const char dateTime[]);
-void blinkLED(void);
+bool initSD(void);
+void datalog(const char basename[]);
+void getBasename(char basename[], const char dateTime[], bool GPSActive);
+bool getDateTime(char stringOriginal[], char dateTime[]);
 void vbatlog(const char basename[], const char dateTime []);
 void writeBatteryVoltage(const char basename[], const char dateTime[]);
 float readBatteryVoltage (void);
+void blinkLED(void);
 const char* nth_strchr(const char* s, int c, int n);
-void getNmeaUpdateCommand(char command[]);
-uint8_t getCheckSum(char *string);
-bool isFreeSpace();
-void findOldestFile();
 
-// main functions
 void setup()
 {
-  Serial.begin(9600);
-  //Serial.begin(115200);  // open USB serial
+    Serial.begin(115200);
 
-  //
-#ifdef WAIT_FOR_USB
-  while (!Serial) {
-    ; // wait for serial port to connect. Needed for native USB
-  }
-#endif
-
-  initSD();
-  configGPS();
-  delay(1000);
-
-  buffer.reserve(GPS_BUFFER_SIZE_TYPICAL);
-  gpsSerial.flush();
+    initSD();
+    configGPS();
+    delay(1000);
+    
+    GPSBuffer.reserve(GPS_BUFFER_SIZE_TYPICAL);
+    GPSSerial.flush();
 }
 
 /* Rationale: GPS keeps sending characters via a serial event;
-   We store the GPS characters in a string (buffer).
-   When the GPS stops talking, then we log the data to SD card.
-*/
+ * We store the GPS characters in a string (GPSBuffer).
+ * When the GPS stops talking, then we log the data to SD card.
+ */
 
 void loop()
 {
-  bool isGPSValid; // = gpsActive(?)
-  char dateTime[6 + 6 + 1]; // yymmddHHMMSS\0
-  char basename[BASENAME_LEN_MAX];
-  unsigned long timeStart = millis();
-  // time interval elapsed since last buffer write:
-  unsigned long bufferTimeIdle = timeStart - bufferTimeEnd;
+    bool GPSActive;
+    char dateTime[6+6+1];  // yymmddHHMMSS\0
+    char basename[MAX_BASENAME_LEN];
+    unsigned long startTime=millis();
 
+    // time interval elapsed since last GPS serial read:
+    unsigned long idleTime = startTime - bufferTime;
 
+    // we will write only when there is no char coming from the GPS:
+    if (idleTime < IDLE_THRESHOLD || GPSBuffer.length() < 3) { return; }
 
-#ifdef USING_M0_BOARD
-  if (gpsSerial.available()) {
-    // M0 board doesn't support serial events natively
-    // <https://forums.adafruit.com/viewtopic.php?f=52&t=140637&p=695321&hilit=m0+serialevent#p695321>
-    gpsSerialEvent();
-  }
-#endif
+    // GPS serial went silent, now log data to SD card.
+ 
+    serialPrintln("[DEBUG] starting.");
+    serialPrint(GPSBuffer);
 
-  if ( bufferTimeIdle < BUFFER_IDLE_THRESHOLD || buffer.length() < 3) {
-    return;
-  }
-
-  serialPrintln("to be written to SD:");
-  serialPrintln(buffer);
-
-  // GPS serial went silent, now try to log data to SD card.
-#ifdef VERBOSE
-  serialPrint(F("[VERBOSE] GPS serial idle for (ms): "));
-  serialPrintln(bufferTimeIdle);
-#endif
-
-  isGPSValid = getDateTime(buffer.c_str(), dateTime);
-
-  if (!isGPSValid)
-  {
+    GPSActive = getDateTime(GPSBuffer.c_str(), dateTime);
+    if (!GPSActive)
+    {
 #ifdef WAIT_FOR_VALID_GPS
-    serialPrintln(F("[DEBUG] waiting for GPS to be valid."));
-    resetBuffer();
-    return;
+        serialPrintln("[DEBUG] waiting for GPS");
+        return;
 #endif
-  }
+    }
 
+    getBasename(basename, dateTime, GPSActive);
+    
+    datalog(basename);
 
-  getBasename(basename, dateTime, isGPSValid);
+    vbatlog(basename, dateTime);
 
-  datalog(basename);
+    // calculate number of blocks per file:
+    if (strcmp(basename, basenameOld) != 0)
+    {
+        strncpy(basenameOld, basename, strlen(basename)+1);
+        numBlk=0;
+    }
+    numBlk++;
+    serialPrintln("[DEBUG] number of blocks: " + String(numBlk));
 
-  vbatlog(basename, dateTime);
-
-  // clear the buffer and preallocate memory:
-  resetBuffer();
-
-  //#### pq essa mensagem? O tamanho é fixo e definido no cabeçalho do código.
-#ifdef VERBOSE
-  serialPrint(F("[DEBUG] GPS buffer size: "));
-  serialPrintln(GPS_BUFFER_SIZE_TYPICAL);
-#endif
-
-  serialPrint(F("[DEBUG] done writing; time ellapsed on loop() function (ms): "));
-  serialPrintln(millis() - timeStart);
-  serialPrintln("");
-
-  
-  if (strcmp(basename, basenameOld) != 0)
-  {
-    strncpy(basenameOld, basename, strlen(basename) + 1);
-  }  
+    // clear the buffer and preallocate it:
+    GPSBuffer = "";
+    GPSBuffer.reserve(GPS_BUFFER_SIZE_TYPICAL);
+ 
+    serialPrintln("[DEBUG] done; time ellapsed: " +
+                   String(millis() - startTime) + " ms.\n");
+}
+    
+void vbatlog(const char basename[], const char dateTime [])
+{
+    if( BATTERY_UPDATE_INTERVAL == 0 ) { return; }
+    unsigned long batteryTimeStart = millis();
+    unsigned long batteryTimeIdle = batteryTimeStart - batteryTimeEnd;
+    unsigned long batteryTimeTol = BATTERY_UPDATE_INTERVAL - batteryTimeBusy*0.9;
+    if( batteryTimeIdle < batteryTimeTol ) { return; }
+    writeBatteryVoltage(basename, dateTime);
+    batteryTimeEnd = millis();
+    batteryTimeBusy = batteryTimeEnd - batteryTimeStart;
 }
 
-// called in between loops, every time a new character appears at gpsSerial
-void gpsSerialEvent()
+void writeBatteryVoltage (const char basename[], const char dateTime[])
 {
-  unsigned long bufferTimeStart = millis();
+    char filename[MAX_FILENAME_LEN];
+    strncpy(filename, basename, strlen(basename)+1);
+    strcat(filename, ".bat");
+    serialPrintln("[DEBUG] filename (battery): " + String(filename));
 
-  // store the caracter in the buffer
-  buffer += char(gpsSerial.read());
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file)
+    {
+        serialPrintln("[ERROR] Unable to open file '" + String(filename) + "'.");
+        return;
+    }
 
-  // restart the idle timer count
-  bufferTimeEnd = millis();
+    file.print(dateTime);
+    file.print("\t");
+    file.print(readBatteryVoltage());
+    file.println("");
 
-#ifdef VERBOSE
-  serialPrint("[VERBOSE] gpsSerialRead time (ms): ");
-  serialPrintln(bufferTimeEnd - bufferTimeStart);
-#endif
+    file.close();
+}
+
+float readBatteryVoltage (void)
+{
+    float measuredvbat = analogRead(VBATPIN);
+    measuredvbat *= 2;    // we divided by 2, so multiply back
+    measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
+    measuredvbat /= 1024; // convert to voltage
+    return measuredvbat;
 }
 
 
-// reset GPS buffer and serial:
-void resetBuffer()
+// called in between loops, every time a new character appears at GPSSerial
+void GPSSerialEvent()
 {
-  buffer = "";
-  buffer.reserve(GPS_BUFFER_SIZE_TYPICAL);
+    char c = GPSSerial.read();
 
+    // store the caracter in the buffer
+    GPSBuffer += c;
+
+    // restart the idle timer count
+    bufferTime = millis();
 }
 
 
 // configure the GPS settings
 void configGPS(void)
 {
-  // configure the GPS baud rate:
-  configGPSBaudRate();
+    //GPSSerial.begin(GPS_BAUD_RATE);
+    configGPSBaudRate();
 
-  // configure the GPS update rate:
-  // (e.g., PMTK_SET_NMEA_UPDATE_1HZ)
-  char command[18 + sizeof(int) * 2];
-  getNmeaUpdateCommand(command);
-  gpsSerial.println(command);
+    switch (GPS_UPDATE_INTERVAL)
+    {
+        case 100:
+            //PMTK_SET_NMEA_UPDATE_10HZ
+            GPSSerial.println("$PMTK220,100*2F\r\n");
+            break;
+        case 1000:
+            // PMTK_SET_NMEA_UPDATE_1HZ
+            GPSSerial.println("$PMTK220,1000*1F\r\n");
+            break;
+        case 10000:
+            // PMTK_SET_NMEA_UPDATE_100_MILLIHERTZ
+            GPSSerial.println("$PMTK220,10000*2F\r\n");
+            break;
+    }
+    
+    // GPSSerial.println("$PGCMD,33,1*6C");  // PGCMD_ANTENNA
+    GPSSerial.println("$PGCMD,33,0*6D");  // PGCMD_NOANTENNA
 
-  // don't show antenna status messages
-  // gpsSerial.println(F("$PGCMD,33,1*6C"));  // PGCMD_ANTENNA
-  gpsSerial.println(F("$PGCMD,33,0*6D"));  // PGCMD_NOANTENNA
-
-  // define which NMEA messages to print (PMTK_SET_NMEA_OUTPUT_RMCGGAGSV):
-  gpsSerial.println(F("$PMTK314,0,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*29"));
-
-  // disable speed threshold, so that coordinates do change:
-  gpsSerial.println(F("$PMTK397,0.0*3D"));
-
-  // disable Active Interference Cancellation (AIC)
-  gpsSerial.println(F("$PMTK286,0*22"));
-
-  serialPrintln(F("[DEBUG] GPS configured."));
+    // PMTK_SET_NMEA_OUTPUT_RMCGGAGSV:
+    GPSSerial.println("$PMTK314,0,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0*29");
 }
 
+void configGPSBaudRate(void) {
+    if (GPS_BAUD_RATE == GPS_BAUD_RATE_DEFAULT) {
+        GPSSerial.begin(GPS_BAUD_RATE);
+        return;
+    }
+    
+    // open GPS at default baud rate (9600) then 
+    // change it to the new rate (115200) and reconnect:
+    // (if it was already at 115200, it will be ignored.)
+    GPSSerial.begin(GPS_BAUD_RATE_DEFAULT);
+    switch (GPS_BAUD_RATE)
+    {
+        case 57600:
+            // PMTK_SET_BAUD_57600
+            GPSSerial.println("$PMTK251,57600*2C");
+            break;
+        case 115200:
+            // PMTK_SET_BAUD_115200
+            GPSSerial.println("$PMTK251,115200*1F");
+            break;
+    }
 
-// configure GPS baud rate
-void configGPSBaudRate(void)
-{
-  if (GPS_BAUD_RATE == GPS_BAUD_RATE_DEFAULT) {
-    gpsSerial.begin(GPS_BAUD_RATE);
-    return;
-  }
-
-  // open GPS at default baud rate (9600) then
-  // change it to the new rate (115200) and reconnect:
-  // (if it was already at 115200, it will be ignored.)
-  gpsSerial.begin(GPS_BAUD_RATE_DEFAULT);
-  switch (GPS_BAUD_RATE)
-  {
-    case 57600:
-      // PMTK_SET_BAUD_57600
-      gpsSerial.println(F("$PMTK251,57600*2C"));
-      break;
-    case 115200:
-      // PMTK_SET_BAUD_115200
-      gpsSerial.println(F("$PMTK251,115200*1F"));
-      break;
-  }
-
-  delay(1000);
-  gpsSerial.begin(GPS_BAUD_RATE);
+    delay(1000);
+    GPSSerial.begin(GPS_BAUD_RATE);
 }
-
 
 // initialize SD card
 bool initSD(void)
 {
-  // WARNING: SD.begin() can only be called once due to a bug at the Arduino SD.h standard library
+    // WARNING: SD.begin() can only be called once due to a bug at the
+    // Arduino SD.h standard library
 
-  if (!sd.begin(SDCard, SD_SCK_MHZ(12))) 
-  {
-    serialPrintln(F("[ERROR] Unable to initialized SD card."));
-    return false;
-  }
-  serialPrintln(F("[DEBUG] SD card initialized."));
+    if (!SD.begin(SDCard))
+    {
+        serialPrintln("[ERROR] Unable to initialized SD card.");
+        return false;
+    }
 
-  return true;
+    return true;
+}
+
+// write data do SD card
+void datalog(const char basename[])
+{
+    char filename[MAX_FILENAME_LEN];
+    strncpy(filename, basename, strlen(basename)+1);
+    strcat(filename, ".log");
+    serialPrintln("[DEBUG] filename (GPS): " + String(filename));
+    
+    // open the file
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file)
+    {
+        serialPrintln("[ERROR] Unable to open file '" + String(filename) + "'.");
+        //return;
+    }
+
+    // get the size of string to check latter if it has been all written:
+    byte len1 = GPSBuffer.length();
+    
+    // write whole GPS buffer on the SD file at once:
+    byte len2 = file.print(GPSBuffer);
+    
+    // insert a blank line between blocks:
+    file.println();
+
+    // closing the file to guarantee integrity:
+    // (it costs about 200 ms, same as flush())
+    //return true;
+    file.close();
+
+    if (len2 == len1) { blinkLED(); }
+    String prefix = "[DEBUG]";
+    if (len2 != len1) { prefix = "[ERROR]"; }
+    serialPrintln(prefix + " " + (100*len2/len1) + "%" + " of " + String(len1) + " bytes written to SD file '" + String(filename) + "'");
+}
+
+// blink the light emitting diode:
+void blinkLED(void) {
+#ifndef BLINK_LED_IF_OKAY
+    return;
+#endif
+    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(10);              // wait a little
+    digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
+}
+
+// obtain basename:
+void getBasename(char basename[], const char dateTime[], bool GPSActive)
+{
+    if(!GPSActive)
+    {
+        // use default basename:
+        strncpy(basename, basenameDefault, strlen(basenameDefault)+1);
+        return;
+    }
+
+    // decide how many characters to copy:
+    int num;
+    switch (fileDuration)
+    {
+    case 'H':  // hour
+        num = 8;
+        break;
+    case 'D':  // day
+        num = 6;
+        break;
+    default:
+        serialPrintln("[ERROR] Filename duration not recognized; assuming hourly.");
+        num = 8;
+    }
+
+    // copy date/time (YYMMDDhh) for the basename:
+    strncpy(basename, dateTime, num);
+    
+    // null-terminate string:
+    basename[num]='\0';
+    
+    serialPrintln("[DEBUG] basename: " + String(basename));
 }
 
 // fills a string with date and time from the GPS:
-bool getDateTime(const char strInp[], char dateTimeOut[])
+bool getDateTime(const char stringOriginal[], char dateTimeOut[])
 {
-  char  strTemp[82];  // as per <https://en.wikipedia.org/wiki/NMEA_0183>
-  char* limInf = NULL;
-  char* limSup = NULL;
-  const char *dateIn;
-  const char *timeIn;
-  int len;
+    char  strTemp[82];  // as per <https://en.wikipedia.org/wiki/NMEA_0183>
+    char* limInf=NULL;
+    char* limSup=NULL;
+    const char *dateIn;
+    const char *timeIn;
+    int len;
 
-  /* here we handle a string like this:
-       $GPRMC,144016.000,A,3001.2778,S,05113.2839,W,0.01,37.24,090318,,,A*59
-    then find the date (090318) and time (144016, discarding decimal seconds),
-    and finally reorder it as YYMMDDhhmmss: 180309124016.
-  */
-
-
-#ifdef VERBOSE
-  serialPrintln(F("[VERBOSE] Starting getDateTime."));
-#endif
-
-  /* here we handle a string like this:
-        $GPRMC,144016.000,A,3001.2778,S,05113.2839,W,0.01,37.24,090318,,,A*59
-     then find the date (090318) and time (144016, discarding decimal seconds),
-     and finally reorder it as YYMMDDhhmmss: 180309124016.
-  */
-
-
-  if (strlen(strInp) == 0)
-  {
-    serialPrintln("[DEBUG] Empty GPS string.");
-    return false;
-  }
-
-
-  // find beginning of $GPRMC sentence:
-  limInf = strstr(strInp, "$GPRMC");
-  if (!limInf)
-  {
-    serialPrintln("[DEBUG] $GPRMC not found.");
-    return false;
-  }
-
-  // verify if GPS is active:
-  if ((limInf[18] != 'A'))
-  {
-#ifdef DEBUG
-    serialPrintln(F("[VERBOSE] GPS not valid."));
-#endif
-    return false;
-  }
-
-  // find end of $GPRMC sentence:
-  limSup = strchr(limInf, '\n');
-  len = (limSup - limInf) + 1;
-  strncpy(strTemp, limInf, min(len, sizeof(strTemp) - 1));
-  strTemp[len] = '\0';
-
-  // extract date, reordering components (DDMMYY -> YYMMDD):
-  dateIn = nth_strchr(strTemp, ',', 9) + 1;
-  dateTimeOut[0] = dateIn[4];  // year
-  dateTimeOut[1] = dateIn[5];  // year
-  dateTimeOut[2] = dateIn[2];  // month
-  dateTimeOut[3] = dateIn[3];  // month
-  dateTimeOut[4] = dateIn[0];  // day
-  dateTimeOut[5] = dateIn[1];  // day
-
-  // extract time, keeping the order (hhmmss):
-  timeIn = &strTemp[7];
-  strncpy(&dateTimeOut[6], timeIn, 6);
-
-  // terminate string:
-  dateTimeOut[12] = '\0';
-#ifdef VERBOSE
-  serialPrint(F("[VERBOSE] dateTime: "));
-  serialPrintln(dateTimeOut);
-#endif
-
-  return true;
-}
-
-
-// obtain basename:
-void getBasename(char basename[], const char dateTime[], bool isGPSValid)
-{
-  if (!isGPSValid)
-  {
-    // use default basename:
-    strncpy(basename, basenameDefault, strlen(basenameDefault) + 1);
-    return;
-  }
-
-  // decide how many characters to copy:
-  int num;
-  switch (fileDuration)
-  {
-    case 'H':  // hour
-      num = 8;
-      break;
-    case 'D':  // day
-      num = 6;
-      break;
-    default:
-      serialPrintln(F("[ERROR] Filename duration not recognized; assuming hourly."));
-      num = 8;
-  }
-
-  // copy date/time (YYMMDDhh) for the basename:
-  strncpy(basename, dateTime, num);
-
-  // null-terminate string:
-  basename[num] = '\0';
-  if(basename[6] == '0' && basename[7] =='0') // default hour = 00
-  {
-    if(!alreadyVerifiedSpace && !isFreeSpace())
+    /* here we handle a string like this: 
+     *    $GPRMC,144016.000,A,3001.2778,S,05113.2839,W,0.01,37.24,090318,,,A*59
+     * then find the date (090318) and time (144016, discarding decimal seconds),
+     * and finally reorder it as YYMMDDhhmmss: 180309124016.
+    */
+    
+    if(strlen(stringOriginal)==0)
     {
-      serialPrintln("[DEBUG] Start SD Card Verification");
-      alreadyVerifiedSpace=true;
-    // delete the 2 files(.log/.bat) associated with the name YYMMDDhh
-      findOldestFile();
-      serialPrintln("[DEBUG] achou: " + String(oldestFileLOG));
-      strcat(oldestFileLOG,".log");
-      if (sd.remove(oldestFileLOG)) {
-        serialPrintln("[DEBUG]" + String(oldestFileLOG) + "successfully deleted");
-      }
-      else
-      {
-        serialPrintln(F("[DEBUG] Fail to delete .log"));
-      }
-      strncpy(oldestFileBAT,oldestFileLOG,8);
-      oldestFileBAT[8]='\0';
-      strcat(oldestFileBAT,".bat");
-      if (sd.remove(oldestFileBAT)) {
-        serialPrintln("[DEBUG]" + String(oldestFileBAT) + "successfully deleted");
-      }
-      else
-      {
-        serialPrintln(F("[DEBUG] Fail to delete .bat"));
-      }
+        serialPrintln("[DEBUG] Empty GPS string.");
+        return false;
     }
-  }
-  else
-  {
-    alreadyVerifiedSpace=false;
-  }
 
-#ifdef VERBOSE
-  serialPrint(F("[VERBOSE] basename: "));  serialPrintln(basename);
-#endif
+    // find beginning of $GPRMC sentence:
+    limInf=strstr(stringOriginal, "$GPRMC");
+    if(!limInf)
+    {
+        serialPrintln("[DEBUG] $GPRMC not found.");
+        return false;
+    }
+    serialPrint(limInf);
+
+    // verify if GPS is active:
+    if((limInf[18]!='A'))
+    {
+        serialPrintln("[DEBUG] GPS not valid.");
+        return false;
+    }
+
+    // find end of $GPRMC sentence:
+    limSup=strchr(limInf, '\n');
+    len=(limSup-limInf)+1;
+    strncpy(strTemp, limInf, min(len, sizeof(strTemp)-1));
+    strTemp[len]='\0';
+
+    // extract date, reordering components (DDMMYY -> YYMMDD):
+    dateIn = nth_strchr(strTemp, ',', 9) + 1;
+    dateTimeOut[0] = dateIn[4];  // year
+    dateTimeOut[1] = dateIn[5];  // year
+    dateTimeOut[2] = dateIn[2];  // month
+    dateTimeOut[3] = dateIn[3];  // month
+    dateTimeOut[4] = dateIn[0];  // day
+    dateTimeOut[5] = dateIn[1];  // day
+
+    // extract time, keeping the order (hhmmss):
+    timeIn = &strTemp[7];
+    strncpy(&dateTimeOut[6], timeIn, 6);
+
+    // terminate string:
+    dateTimeOut[12]='\0';
+    serialPrintln("[DEBUG] dateTime: " + String(dateTimeOut));
+
+    return true;
 }
-
-
-// write data to SD card
-void datalog(const char basename[])
-{
-  char filename[FILENAME_LEN_MAX];
-  strncpy(filename, basename, min(BASENAME_LEN_MAX, strlen(basename) + 1));
-  strcat(filename, ".log");
-  //char filename[] = "test.log";  // DEBUG
-#ifdef VERBOSE
-  serialPrint(F("[VERBOSE] filename (GPS): "));  serialPrintln(filename);
-#endif
-
-  // open the file
-  File file = sd.open(filename, FILE_WRITE);
-  if (!file)
-  {
-    //        serialPrintln(F("[ERROR] Unable to open GPS log file."));
-    serialPrintln("[ERROR] Unable to open file '" + String(filename) + "'.");
-    serialPrintln(F("[ERROR] Check if SD card is connected"));
-    return;
-  }
-
-  // get the size of string to check latter if it has been all written:
-  byte len1 = buffer.length();
-
-  // write whole GPS buffer on the SD file at once:
-  byte len2 = file.print(buffer);
-
-  // insert a blank line between blocks:
-  file.println();
-
-  // closing the file to guarantee integrity:
-  // (it costs about 200 ms, same as flush())
-  //return true;
-  file.close();
-
-  // give visual feedback to user:
-  if (len2 == len1) {
-    blinkLED();
-  }
-
-  // give written feedback to user:
-  String prefix = "[DEBUG]";
-  if (len2 != len1) {
-    prefix = "[ERROR]";
-  }
-  serialPrintln(prefix + " " + (100 * len2 / len1) + "%" + " of " + String(len1) + " bytes written to SD file '" + String(filename) + "'");
-
-  sdcardTimeEnd = millis();
-}
-
-// blink the light emitting diode (LED):
-void blinkLED(void) {
-#ifndef BLINK_LED_IF_WRITING_OKAY
-  return;
-#endif
-  digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-  delay(5);              // wait a little
-  digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
-}
-
-
-// manage battery voltage logging:
-void vbatlog(const char basename[], const char dateTime [])
-{
-  if ( BATTERY_UPDATE_INTERVAL == 0 ) {
-    return;
-  }
-  unsigned long batteryTimeStart = millis();
-  unsigned long batteryTimeIdle = batteryTimeStart - batteryTimeEnd;
-  if ( batteryTimeIdle < BATTERY_UPDATE_INTERVAL ) {
-    return;
-  }
-  writeBatteryVoltage(basename, dateTime);
-  batteryTimeEnd = millis();
-}
-
-
-// write battery voltage to SD card:
-void writeBatteryVoltage (const char basename[], const char dateTime[])
-{
-  char filename[FILENAME_LEN_MAX];
-  strncpy(filename, basename, strlen(basename) + 1);
-  strcat(filename, ".bat");
-  serialPrint(F("[DEBUG] filename (battery): "));  serialPrintln(filename);
-
-  File file = sd.open(filename, FILE_WRITE);
-  //File file = SD.open("test.bat", FILE_WRITE);  // DEBUG
-  if (!file)
-  {
-    serialPrintln(F("[ERROR] Unable to open battery log file."));
-    return;
-  }
-
-  file.print(dateTime);
-  file.print("\t");
-  file.print(readBatteryVoltage());
-  file.println("");
-
-  file.close();
-}
-
-
-// read battery voltage:
-float readBatteryVoltage (void)
-{
-  float measuredvbat = analogRead(VBATPIN);
-  measuredvbat *= 2;    // we divided by 2, so multiply back
-  measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
-  measuredvbat /= 1024; // convert to voltage
-  return measuredvbat;
-}
-
 
 // returns a pointer to the nth character in a string:
 const char* nth_strchr(const char* s, int c, int n)
 {
-  int c_count;
-  char* nth_ptr;
+    int c_count;
+    char* nth_ptr;
 
-  for (c_count = 1, nth_ptr = strchr(s, c);
-       nth_ptr != NULL && c_count < n && c != 0;
-       c_count++)
-  {
-    nth_ptr = strchr(nth_ptr + 1, c);
-  }
-
-  return nth_ptr;
-}
-
-
-// calculate NMEA check-sum given a string:
-uint8_t getCheckSum(char *string)
-{
-  int XOR = 0;
-  for (int i = 0; i < strlen(string); i++) {
-    XOR = XOR ^ string[i];
-  }
-  return XOR;
-}
-
-
-// prepare command to configure NMEA update rate
-void getNmeaUpdateCommand(char command[]) {
-  // examples:
-  // PMTK_SET_NMEA_UPDATE_10HZ: "$PMTK220,100*2F\r\n"
-  // PMTK_SET_NMEA_UPDATE_1HZ: "$PMTK220,1000*1F\r\n"
-  // PMTK_SET_NMEA_UPDATE_100_MILLIHERTZ: "$PMTK220,10000*2F\r\n"
-  char message[12] = "PMTK220,";
-  char updateInterval[6];
-  char checksum [sizeof(int) * 2 + 1];
-
-  itoa(GPS_UPDATE_INTERVAL, updateInterval, 10);
-  strcat(message, updateInterval);
-  sprintf(checksum, "%X", getCheckSum(message));
-
-  strcpy(command, "$");
-  strcat(command, message);
-  strcat(command, "*");
-  strcat(command, checksum);
-  strcat(command, "\r\n");
-}
-//adapted from the example VolumeFreeSpace from the SDFat library
-bool isFreeSpace() {
-  uint32_t volFree = sd.vol()->freeClusterCount();
-  float freeSpace = 0.000512 * volFree * sd.vol()->blocksPerCluster(); //0,000512 because each block has 512 bytes and is converted to MB
-  if (freeSpace < MaxFreeSpaceSdCard) //freeSpace->MB
-  {
-    serialPrint(F("[DEBUG] Sd Card is FULL \n"));
-    return false;
-  }
-  serialPrint("[DEBUG] Sd Card has " + String(freeSpace) + "MB free \n ");
-  return true;
-}
-  void findOldestFile()
-{
-  char file_aux_loop[13];
-  char file_aux_loop_cat[9];
-  SdFile root;
-  SdFile file;
-  bool find_first = true;
-  if (!root.open("/"))
-  {
-    sd.errorHalt(F("[DEBUG]open root failed"));
-  }
-  //just to find the first file 
-  while (find_first)
-  {
-    file.openNext(&root, O_READ);
-    file.getName(file_aux_loop, 13);
-    if (strcmp(file_aux_loop, "System Volum") != 0)
+    for (c_count=1,nth_ptr=strchr(s,c);
+         nth_ptr != NULL && c_count < n && c!=0;
+         c_count++)
     {
-      if (strcmp(file_aux_loop, "DEFAULT.log") != 0 && strcmp(file_aux_loop, "DEFAULT.LOG") != 0 && strcmp(file_aux_loop, "DEFAULT.bat") !=0)
-      {
-        strncpy(oldestFileLOG,file_aux_loop,8);// just YYMMDDhh
-        oldestFileLOG[8]='\0';
-        find_first=false;
-      }
+         nth_ptr = strchr(nth_ptr+1, c);
     }
-    file.close();
-  }
-  while (file.openNext(&root, O_READ))
-  {
-    file.getName(file_aux_loop, 13);
-    if (strcmp(file_aux_loop, "System Volume") != 0)
-    {
-      if (strcmp(file_aux_loop, "DEFAULT.log") != 0 && strcmp(file_aux_loop, "DEFAULT.LOG") !=0 && strcmp(file_aux_loop, "DEFAULT.bat") !=0)
-      {
-        strncpy(file_aux_loop_cat,file_aux_loop,8);// just YYMMDDhh
-        file_aux_loop_cat[8]='\0';
-        if (atol(file_aux_loop_cat)<atol(oldestFileLOG))
-        {
-          strcpy(oldestFileLOG,file_aux_loop_cat);
-          oldestFileLOG[8]='\0';
-        }       
-      }
-    }
-    file.close();
-  }
+
+    return nth_ptr;
 }
+
